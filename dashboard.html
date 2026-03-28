@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deep Horizon — Live Tracking Dashboard</title>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #09090b; color: #e4e4e7; }
+
+    /* ── Header ──────────────────────────────────────────────── */
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 24px; border-bottom: 1px solid #27272a; background: #0a0a0a;
+    }
+    .header h1 { font-size: 18px; font-weight: 700; }
+    .header .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 12px; padding: 4px 10px; border-radius: 20px;
+    }
+    .badge.live { background: #22c55e20; color: #22c55e; }
+    .badge.off { background: #3f3f4640; color: #71717a; }
+    .conn-dot { width: 6px; height: 6px; border-radius: 50%; }
+    .conn-dot.on { background: #22c55e; box-shadow: 0 0 6px #22c55e80; }
+    .conn-dot.off { background: #ef4444; }
+
+    /* ── Tabs ─────────────────────────────────────────────────── */
+    .tabs {
+      display: flex; gap: 0; border-bottom: 1px solid #27272a; background: #0a0a0a;
+    }
+    .tab {
+      padding: 10px 24px; font-size: 13px; font-weight: 600; cursor: pointer;
+      color: #71717a; border-bottom: 2px solid transparent; transition: all 0.2s;
+    }
+    .tab:hover { color: #a1a1aa; }
+    .tab.active { color: #e4e4e7; border-bottom-color: #22c55e; }
+
+    /* ── Main ─────────────────────────────────────────────────── */
+    .content { padding: 20px 24px; }
+    .section-title { font-size: 13px; font-weight: 600; color: #71717a; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+    .empty { text-align: center; padding: 60px 20px; color: #52525b; font-size: 14px; }
+
+    /* ── User Card ────────────────────────────────────────────── */
+    .user-card {
+      background: #18181b; border: 1px solid #27272a; border-radius: 12px;
+      margin-bottom: 16px; overflow: hidden;
+    }
+    .user-card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-bottom: 1px solid #27272a;
+    }
+    .user-info { display: flex; align-items: center; gap: 12px; }
+    .user-avatar {
+      width: 36px; height: 36px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; font-weight: 700;
+    }
+    .avatar-live { background: #22c55e20; color: #22c55e; }
+    .avatar-history { background: #3b82f620; color: #3b82f6; }
+    .user-name { font-size: 14px; font-weight: 600; }
+    .user-id { font-size: 11px; color: #71717a; font-family: monospace; }
+    .user-meta { display: flex; gap: 16px; align-items: center; }
+    .meta-item { font-size: 11px; color: #a1a1aa; }
+    .meta-value { color: #e4e4e7; font-weight: 600; font-family: monospace; }
+
+    /* ── Map ──────────────────────────────────────────────────── */
+    .map-container { height: 300px; position: relative; }
+    .map-container .leaflet-container { height: 100%; width: 100%; }
+
+    /* ── Session Map (history) ────────────────────────────────── */
+    .session-map-wrap { border-top: 1px solid #27272a; overflow: hidden; }
+    .session-map-wrap .leaflet-container { height: 280px; width: 100%; z-index: 1; }
+    .session-info-bar {
+      display: flex; gap: 20px; padding: 10px 16px;
+      background: #111113; border-top: 1px solid #27272a;
+      flex-wrap: wrap; align-items: center;
+    }
+    .session-info-item {
+      display: flex; flex-direction: column; gap: 1px;
+    }
+    .session-info-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #52525b; }
+    .session-info-value { font-size: 12px; font-family: monospace; color: #a1a1aa; }
+    .session-info-value.green { color: #22c55e; }
+    .session-info-value.red { color: #ef4444; }
+
+    /* ── Stats bar ────────────────────────────────────────────── */
+    .stats-bar {
+      display: flex; gap: 20px; padding: 12px 18px;
+      background: #111113; border-top: 1px solid #27272a;
+    }
+    .stat { display: flex; flex-direction: column; gap: 2px; }
+    .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #52525b; }
+    .stat-value { font-size: 13px; font-family: monospace; color: #a1a1aa; }
+    .stat-value.speed { color: #22c55e; font-weight: 600; }
+
+    /* ── History sessions ─────────────────────────────────────── */
+    .session-list { padding: 0 18px 14px; }
+    .session-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 0; border-bottom: 1px solid #1e1e21; cursor: pointer;
+    }
+    .session-row:hover { background: #1a1a1d; margin: 0 -18px; padding: 10px 18px; border-radius: 6px; border-color: transparent; }
+    .session-row:last-child { border-bottom: none; }
+    .session-name { font-size: 13px; font-weight: 600; color: #e4e4e7; }
+    .session-detail { font-size: 11px; color: #71717a; }
+    .session-expand-btn {
+      background: #27272a; border: none; color: #a1a1aa; font-size: 11px;
+      padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    }
+    .session-expand-btn:hover { background: #3f3f46; color: #e4e4e7; }
+
+    /* ── Pulsing dot ──────────────────────────────────────────── */
+    .pulse-dot {
+      width: 12px; height: 12px; border-radius: 50%; background: #22c55e;
+      box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+      70% { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+    }
+
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <h1>Deep Horizon — Live Dashboard</h1>
+    <div>
+      <span class="badge" id="conn-badge">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span id="conn-text">Connecting...</span>
+      </span>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="live" onclick="switchTab('live')">
+      Live Tracking <span id="live-count" style="margin-left:4px;color:#22c55e"></span>
+    </div>
+    <div class="tab" data-tab="history" onclick="switchTab('history')">
+      History
+    </div>
+  </div>
+
+  <!-- Live Tab -->
+  <div class="content" id="tab-live">
+    <div id="live-users"></div>
+    <div class="empty" id="live-empty">No users being tracked right now</div>
+  </div>
+
+  <!-- History Tab -->
+  <div class="content hidden" id="tab-history">
+    <div id="history-users"></div>
+    <div class="empty" id="history-empty">No session history yet</div>
+    <div id="history-load-more" class="hidden" style="text-align:center;padding:16px">
+      <button onclick="loadMoreHistory()" style="background:#27272a;border:none;color:#a1a1aa;font-size:13px;padding:8px 24px;border-radius:8px;cursor:pointer">Load More</button>
+      <div id="history-page-info" style="font-size:11px;color:#52525b;margin-top:6px"></div>
+    </div>
+  </div>
+
+  <script>
+    const BASE = 'http://localhost:9001';
+
+    // ── State ─────────────────────────────────────────────────
+    const liveUsers = {};       // userId → { data, map, marker, trail, trailLine }
+    const sessionMaps = {};     // sessionId → leaflet map instance
+    let historyPage = 1;
+    let historyTotalPages = 1;
+    let historyLoading = false;
+
+    // ── Socket.io ─────────────────────────────────────────────
+    const socket = io(BASE, { transports: ['websocket', 'polling'] });
+
+    socket.on('connect', () => {
+      document.getElementById('conn-dot').className = 'conn-dot on';
+      document.getElementById('conn-text').textContent = 'Connected';
+      document.getElementById('conn-badge').className = 'badge live';
+    });
+
+    socket.on('disconnect', () => {
+      document.getElementById('conn-dot').className = 'conn-dot off';
+      document.getElementById('conn-text').textContent = 'Disconnected';
+      document.getElementById('conn-badge').className = 'badge off';
+    });
+
+    socket.on('locationUpdate', (data) => {
+      if (data.stopped) {
+        removeLiveUser(data.userId);
+        loadHistory();
+        return;
+      }
+      updateLiveUser(data);
+    });
+
+    // ── Tabs ──────────────────────────────────────────────────
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+      document.getElementById('tab-live').classList.toggle('hidden', tab !== 'live');
+      document.getElementById('tab-history').classList.toggle('hidden', tab !== 'history');
+      if (tab === 'history') loadHistory();
+      // Fix map rendering when tab becomes visible
+      if (tab === 'live') {
+        Object.values(liveUsers).forEach(u => u.map?.invalidateSize());
+      }
+    }
+
+    // ── Live Users ────────────────────────────────────────────
+    function updateLiveUser(data) {
+      const { userId, lat, lng, speed, timestamp } = data;
+
+      if (!liveUsers[userId]) {
+        createLiveCard(userId);
+      }
+
+      const u = liveUsers[userId];
+      u.data = data;
+
+      // Update trail
+      u.trail.push([lat, lng]);
+      if (u.trail.length > 500) u.trail.shift();
+
+      // Update map
+      u.marker.setLatLng([lat, lng]);
+      u.trailLine.setLatLngs(u.trail);
+      u.map.setView([lat, lng], u.map.getZoom());
+
+      // Add trail dot
+      const dot = L.circleMarker([lat, lng], {
+        radius: 3, fillColor: '#3b82f6', fillOpacity: 0.6,
+        color: '#3b82f6', weight: 0.5, opacity: 0.4,
+      }).addTo(u.map);
+      u.trailDots.push(dot);
+      if (u.trailDots.length > 500) {
+        u.map.removeLayer(u.trailDots.shift());
+      }
+
+      // Update stats
+      const speedKmh = (speed != null && speed >= 0) ? (speed * 3.6).toFixed(1) : '0.0';
+      document.getElementById(`stats-${userId}`).innerHTML = `
+        <div class="stat"><span class="stat-label">Latitude</span><span class="stat-value">${lat.toFixed(6)}</span></div>
+        <div class="stat"><span class="stat-label">Longitude</span><span class="stat-value">${lng.toFixed(6)}</span></div>
+        <div class="stat"><span class="stat-label">Speed</span><span class="stat-value speed">${speedKmh} km/h</span></div>
+        <div class="stat"><span class="stat-label">Points</span><span class="stat-value">${u.trail.length}</span></div>
+        <div class="stat"><span class="stat-label">Last Update</span><span class="stat-value">${timeAgo(timestamp)}</span></div>
+      `;
+
+      updateLiveCount();
+      document.getElementById('live-empty').classList.add('hidden');
+    }
+
+    function createLiveCard(userId) {
+      const initials = userId.slice(0, 2).toUpperCase();
+      const container = document.getElementById('live-users');
+
+      const card = document.createElement('div');
+      card.className = 'user-card';
+      card.id = `live-${userId}`;
+      card.innerHTML = `
+        <div class="user-card-header">
+          <div class="user-info">
+            <div class="user-avatar avatar-live">${initials}</div>
+            <div>
+              <div class="user-name">${userId}</div>
+              <div class="user-id">Live tracking</div>
+            </div>
+          </div>
+          <div class="pulse-dot"></div>
+        </div>
+        <div class="map-container" id="map-${userId}"></div>
+        <div class="stats-bar" id="stats-${userId}"></div>
+      `;
+      container.appendChild(card);
+
+      // Init leaflet map
+      const map = L.map(`map-${userId}`, { zoomControl: false }).setView([26.14, 91.73], 16);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap',
+      }).addTo(map);
+
+      // Pulsing marker using divIcon
+      const pulseIcon = L.divIcon({
+        className: '',
+        html: `<div style="position:relative;width:20px;height:20px">
+          <div style="position:absolute;inset:0;border-radius:50%;background:rgba(34,197,94,0.3);animation:pulse 2s infinite"></div>
+          <div style="position:absolute;top:4px;left:4px;width:12px;height:12px;border-radius:50%;background:#22c55e;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.3)"></div>
+        </div>`,
+        iconSize: [20, 20],
+        iconAnchor: [10, 10],
+      });
+
+      const marker = L.marker([26.14, 91.73], { icon: pulseIcon }).addTo(map);
+      const trailLine = L.polyline([], { color: '#3b82f6', weight: 3, opacity: 0.7 }).addTo(map);
+
+      liveUsers[userId] = { data: null, map, marker, trail: [], trailLine, trailDots: [] };
+    }
+
+    function removeLiveUser(userId) {
+      const u = liveUsers[userId];
+      if (!u) return;
+      u.map.remove();
+      document.getElementById(`live-${userId}`)?.remove();
+      delete liveUsers[userId];
+      updateLiveCount();
+      if (Object.keys(liveUsers).length === 0) {
+        document.getElementById('live-empty').classList.remove('hidden');
+      }
+    }
+
+    function updateLiveCount() {
+      const count = Object.keys(liveUsers).length;
+      document.getElementById('live-count').textContent = count > 0 ? `(${count})` : '';
+    }
+
+    // ── History (paginated) ─────────────────────────────────
+    function renderSessionCard(s) {
+      return `
+        <div class="session-row" onclick="toggleSessionDetails('${s.id}', this)">
+          <div style="flex:1">
+            <div class="session-name">${s.session_name} <span style="color:#52525b;font-weight:400;font-size:11px">(${s.user_id})</span></div>
+            <div class="session-detail">
+              ${new Date(s.started_at).toLocaleString()} &middot;
+              ${formatDuration(s.duration_secs)} &middot;
+              ${s.total_pings} points
+            </div>
+          </div>
+          <button class="session-expand-btn">Details</button>
+        </div>
+        <div id="session-details-${s.id}" class="hidden" style="padding:12px 18px;background:#111113;border-bottom:1px solid #27272a">
+          <div style="color:#52525b;font-size:12px">Loading...</div>
+        </div>
+      `;
+    }
+
+    async function loadHistory() {
+      historyPage = 1;
+      historyLoading = false;
+      document.getElementById('history-users').innerHTML = '';
+      await fetchHistoryPage(1);
+    }
+
+    async function fetchHistoryPage(page) {
+      if (historyLoading) return;
+      historyLoading = true;
+
+      try {
+        const sessRes = await fetch(`${BASE}/sessions/all?page=${page}&limit=20`);
+        const sessData = await sessRes.json();
+
+        if (!sessData.ok) return;
+
+        const container = document.getElementById('history-users');
+        const loadMoreDiv = document.getElementById('history-load-more');
+        const pageInfo = document.getElementById('history-page-info');
+
+        if (sessData.data.length === 0 && page === 1) {
+          document.getElementById('history-empty').classList.remove('hidden');
+          loadMoreDiv.classList.add('hidden');
+          return;
+        }
+
+        document.getElementById('history-empty').classList.add('hidden');
+
+        // Group this page's sessions by user
+        const grouped = {};
+        sessData.data.forEach(s => {
+          if (!grouped[s.user_id]) grouped[s.user_id] = [];
+          grouped[s.user_id].push(s);
+        });
+
+        Object.entries(grouped).forEach(([userId, sessions]) => {
+          // Check if user card already exists (from previous page)
+          let existingList = document.getElementById(`sessions-${userId}`);
+          if (existingList) {
+            existingList.innerHTML += sessions.map(renderSessionCard).join('');
+          } else {
+            const initials = userId.slice(0, 2).toUpperCase();
+            const card = document.createElement('div');
+            card.className = 'user-card';
+            card.innerHTML = `
+              <div class="user-card-header">
+                <div class="user-info">
+                  <div class="user-avatar avatar-history">${initials}</div>
+                  <div>
+                    <div class="user-name">${userId}</div>
+                    <div class="user-id">Sessions</div>
+                  </div>
+                </div>
+              </div>
+              <div class="session-list" id="sessions-${userId}">
+                ${sessions.map(renderSessionCard).join('')}
+              </div>
+            `;
+            container.appendChild(card);
+          }
+        });
+
+        historyPage = page;
+        historyTotalPages = sessData.totalPages;
+
+        if (page < sessData.totalPages) {
+          loadMoreDiv.classList.remove('hidden');
+          pageInfo.textContent = `Page ${page} of ${sessData.totalPages} (${sessData.total} sessions)`;
+        } else {
+          loadMoreDiv.classList.add('hidden');
+        }
+      } catch (err) {
+        console.error('Failed to load history:', err);
+      } finally {
+        historyLoading = false;
+      }
+    }
+
+    function loadMoreHistory() {
+      fetchHistoryPage(historyPage + 1);
+    }
+
+    // Haversine formula — distance between two lat/lng in meters
+    function haversine(lat1, lng1, lat2, lng2) {
+      const R = 6371000;
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLng = toRad(lng2 - lng1);
+      const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    function formatDistance(meters) {
+      if (meters < 1000) return `${Math.round(meters)} m`;
+      return `${(meters / 1000).toFixed(2)} km`;
+    }
+
+    async function toggleSessionDetails(sessionId, rowEl) {
+      const detailsDiv = document.getElementById(`session-details-${sessionId}`);
+      const btn = rowEl.querySelector('.session-expand-btn');
+
+      if (!detailsDiv.classList.contains('hidden')) {
+        detailsDiv.classList.add('hidden');
+        btn.textContent = 'Details';
+        return;
+      }
+
+      detailsDiv.classList.remove('hidden');
+      btn.textContent = 'Loading...';
+
+      try {
+        const res = await fetch(`${BASE}/session/${sessionId}/logs`);
+        const data = await res.json();
+        const logs = data.data || [];
+
+        if (logs.length === 0) {
+          detailsDiv.innerHTML = '<div style="color:#52525b;font-size:12px">No location data</div>';
+          btn.textContent = 'Hide';
+          return;
+        }
+
+        // Calculate total distance and speed from actual GPS points
+        let totalDistance = 0;
+        const segmentSpeeds = []; // km/h calculated from distance/time between points
+        for (let i = 1; i < logs.length; i++) {
+          const dist = haversine(logs[i - 1].lat, logs[i - 1].lng, logs[i].lat, logs[i].lng);
+          totalDistance += dist;
+          const timeDiff = (new Date(logs[i].recorded_at) - new Date(logs[i - 1].recorded_at)) / 1000; // seconds
+          if (timeDiff > 0 && dist > 1) { // ignore if < 1m (GPS noise)
+            segmentSpeeds.push((dist / timeDiff) * 3.6); // m/s → km/h
+          }
+        }
+
+        const avgSpeed = segmentSpeeds.length > 0
+          ? (segmentSpeeds.reduce((a, b) => a + b, 0) / segmentSpeeds.length).toFixed(1)
+          : '0.0';
+        const maxSpeed = segmentSpeeds.length > 0
+          ? Math.max(...segmentSpeeds).toFixed(1)
+          : '0.0';
+
+        const firstLog = logs[0];
+        const lastLog = logs[logs.length - 1];
+        const startTime = new Date(firstLog.recorded_at).toLocaleTimeString();
+        const endTime = new Date(lastLog.recorded_at).toLocaleTimeString();
+
+        // Reverse geocode start and end
+        const [startPlace, endPlace] = await Promise.all([
+          reverseGeocode(firstLog.lat, firstLog.lng),
+          reverseGeocode(lastLog.lat, lastLog.lng),
+        ]);
+
+        detailsDiv.innerHTML = `
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div style="display:flex;align-items:flex-start;gap:8px">
+              <div style="width:8px;height:8px;border-radius:50%;background:#22c55e;margin-top:4px;flex-shrink:0"></div>
+              <div>
+                <div style="font-size:10px;text-transform:uppercase;color:#52525b;letter-spacing:0.05em">Start</div>
+                <div style="font-size:13px;color:#e4e4e7;font-weight:600">${startPlace}</div>
+                <div style="font-size:11px;color:#71717a;font-family:monospace">${startTime} &middot; ${firstLog.lat.toFixed(6)}, ${firstLog.lng.toFixed(6)}</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:flex-start;gap:8px">
+              <div style="width:8px;height:8px;border-radius:50%;background:#ef4444;margin-top:4px;flex-shrink:0"></div>
+              <div>
+                <div style="font-size:10px;text-transform:uppercase;color:#52525b;letter-spacing:0.05em">End</div>
+                <div style="font-size:13px;color:#e4e4e7;font-weight:600">${endPlace}</div>
+                <div style="font-size:11px;color:#71717a;font-family:monospace">${endTime} &middot; ${lastLog.lat.toFixed(6)}, ${lastLog.lng.toFixed(6)}</div>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:24px;margin-top:12px;padding-top:10px;border-top:1px solid #1e1e21">
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;color:#52525b;letter-spacing:0.05em">Total Distance</div>
+              <div style="font-size:14px;color:#3b82f6;font-weight:700;font-family:monospace">${formatDistance(totalDistance)}</div>
+            </div>
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;color:#52525b;letter-spacing:0.05em">Avg Speed</div>
+              <div style="font-size:14px;color:#a1a1aa;font-weight:600;font-family:monospace">${avgSpeed} km/h</div>
+            </div>
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;color:#52525b;letter-spacing:0.05em">Max Speed</div>
+              <div style="font-size:14px;color:#a1a1aa;font-weight:600;font-family:monospace">${maxSpeed} km/h</div>
+            </div>
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;color:#52525b;letter-spacing:0.05em">Points</div>
+              <div style="font-size:14px;color:#a1a1aa;font-weight:600;font-family:monospace">${logs.length}</div>
+            </div>
+          </div>
+        `;
+
+        btn.textContent = 'Hide';
+      } catch (err) {
+        detailsDiv.innerHTML = '<div style="color:#ef4444;font-size:12px">Failed to load</div>';
+        btn.textContent = 'Retry';
+        console.error(err);
+      }
+    }
+
+    async function toggleSessionMap(sessionId, userId, rowEl) {
+      const wrapDiv = document.getElementById(`session-wrap-${sessionId}`);
+      const mapDiv = document.getElementById(`session-map-${sessionId}`);
+      const infoDiv = document.getElementById(`session-info-${sessionId}`);
+      const btn = rowEl.querySelector('.session-expand-btn');
+
+      if (!wrapDiv.classList.contains('hidden')) {
+        if (sessionMaps[sessionId]) {
+          sessionMaps[sessionId].remove();
+          delete sessionMaps[sessionId];
+        }
+        wrapDiv.classList.add('hidden');
+        btn.textContent = 'View Map';
+        return;
+      }
+
+      btn.textContent = 'Loading...';
+      wrapDiv.classList.remove('hidden');
+
+      try {
+        const res = await fetch(`${BASE}/session/${sessionId}/logs`);
+        const data = await res.json();
+        const logs = data.data || [];
+
+        if (logs.length === 0) {
+          mapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#52525b;font-size:13px">No location points</div>';
+          btn.textContent = 'Hide';
+          return;
+        }
+
+        // Destroy existing map if any
+        if (sessionMaps[sessionId]) {
+          sessionMaps[sessionId].remove();
+          delete sessionMaps[sessionId];
+        }
+
+        const map = L.map(mapDiv, { zoomControl: true }).setView([logs[0].lat, logs[0].lng], 15);
+        sessionMaps[sessionId] = map;
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; OpenStreetMap',
+        }).addTo(map);
+
+        // Filter out duplicate coordinates (user standing still)
+        const MOVE_THRESHOLD = 0.00005; // ~5 meters
+        const uniqueLogs = [logs[0]];
+        for (let i = 1; i < logs.length; i++) {
+          const prev = uniqueLogs[uniqueLogs.length - 1];
+          const curr = logs[i];
+          if (Math.abs(curr.lat - prev.lat) > MOVE_THRESHOLD || Math.abs(curr.lng - prev.lng) > MOVE_THRESHOLD) {
+            uniqueLogs.push(curr);
+          }
+        }
+        // Always include the last point
+        if (uniqueLogs[uniqueLogs.length - 1] !== logs[logs.length - 1]) {
+          uniqueLogs.push(logs[logs.length - 1]);
+        }
+
+        const coords = uniqueLogs.map(l => [l.lat, l.lng]);
+
+        // Trail line
+        L.polyline(coords, { color: '#3b82f6', weight: 3, opacity: 0.8 }).addTo(map);
+
+        // Trail dots with timestamps
+        uniqueLogs.forEach((l, i) => {
+          const speedKmh = (l.speed != null && l.speed >= 0) ? (l.speed * 3.6).toFixed(1) : '—';
+          const time = new Date(l.recorded_at).toLocaleTimeString();
+          const isFirst = i === 0;
+          const isLast = i === uniqueLogs.length - 1;
+
+          const color = isFirst ? '#22c55e' : isLast ? '#ef4444' : '#3b82f6';
+          const radius = (isFirst || isLast) ? 6 : 3;
+
+          const marker = L.circleMarker([l.lat, l.lng], {
+            radius, fillColor: color, fillOpacity: 0.8,
+            color: '#fff', weight: 1, opacity: 0.6,
+          }).addTo(map);
+
+          // Lazy-load place name on popup open
+          const popupContent = document.createElement('div');
+          popupContent.style.fontFamily = 'monospace';
+          popupContent.style.fontSize = '12px';
+          popupContent.innerHTML = `
+            <b>${isFirst ? 'START' : isLast ? 'END' : `Point ${i + 1}`}</b><br>
+            ${l.lat.toFixed(6)}, ${l.lng.toFixed(6)}<br>
+            Speed: ${speedKmh} km/h<br>
+            Time: ${time}<br>
+            <span class="place-label" style="color:#3b82f6">Loading place...</span>
+          `;
+          marker.bindPopup(popupContent);
+
+          marker.on('popupopen', async () => {
+            const placeEl = popupContent.querySelector('.place-label');
+            if (placeEl && placeEl.textContent === 'Loading place...') {
+              const place = await reverseGeocode(l.lat, l.lng);
+              placeEl.textContent = place;
+              placeEl.style.fontWeight = '600';
+            }
+          });
+        });
+
+        // Start marker with place name
+        const startLabel = L.divIcon({
+          className: '',
+          html: `<div style="background:#22c55e;color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;white-space:nowrap" id="start-label-${sessionId}">START</div>`,
+          iconAnchor: [0, 0],
+        });
+        L.marker(coords[0], { icon: startLabel }).addTo(map);
+
+        // End marker with place name
+        const endLabel = L.divIcon({
+          className: '',
+          html: `<div style="background:#ef4444;color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;white-space:nowrap" id="end-label-${sessionId}">END</div>`,
+          iconAnchor: [0, 0],
+        });
+        L.marker(coords[coords.length - 1], { icon: endLabel }).addTo(map);
+
+        // Fetch place names for start/end labels
+        reverseGeocode(coords[0][0], coords[0][1]).then(place => {
+          const el = document.getElementById(`start-label-${sessionId}`);
+          if (el) el.textContent = `START — ${place}`;
+        });
+        reverseGeocode(coords[coords.length - 1][0], coords[coords.length - 1][1]).then(place => {
+          const el = document.getElementById(`end-label-${sessionId}`);
+          if (el) el.textContent = `END — ${place}`;
+        });
+
+        // Info bar below map — start, end, stats
+        const firstLog = uniqueLogs[0];
+        const lastLog = uniqueLogs[uniqueLogs.length - 1];
+        const startTime = new Date(firstLog.recorded_at).toLocaleTimeString();
+        const endTime = new Date(lastLog.recorded_at).toLocaleTimeString();
+
+        infoDiv.innerHTML = `
+          <div class="session-info-item">
+            <span class="session-info-label">Start</span>
+            <span class="session-info-value green" id="start-place-${sessionId}">${startTime} — loading...</span>
+          </div>
+          <div class="session-info-item">
+            <span class="session-info-label">End</span>
+            <span class="session-info-value red" id="end-place-${sessionId}">${endTime} — loading...</span>
+          </div>
+          <div class="session-info-item">
+            <span class="session-info-label">Points</span>
+            <span class="session-info-value">${uniqueLogs.length} unique / ${logs.length} total</span>
+          </div>
+          <div class="session-info-item">
+            <span class="session-info-label">Duplicates Removed</span>
+            <span class="session-info-value">${logs.length - uniqueLogs.length}</span>
+          </div>
+        `;
+
+        // Resolve place names for start & end
+        reverseGeocode(firstLog.lat, firstLog.lng).then(place => {
+          const el = document.getElementById(`start-place-${sessionId}`);
+          if (el) el.textContent = `${startTime} — ${place}`;
+        });
+        reverseGeocode(lastLog.lat, lastLog.lng).then(place => {
+          const el = document.getElementById(`end-place-${sessionId}`);
+          if (el) el.textContent = `${endTime} — ${place}`;
+        });
+
+        // Fit bounds
+        map.fitBounds(L.polyline(coords).getBounds().pad(0.1));
+
+        btn.textContent = 'Hide';
+      } catch (err) {
+        mapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-size:13px">Failed to load</div>';
+        btn.textContent = 'Retry';
+        console.error(err);
+      }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────
+    // Reverse geocode with cache + rate limiting (Nominatim allows 1 req/sec)
+    const geocodeCache = {};
+    const geocodeQueue = [];
+    let geocodeRunning = false;
+
+    async function reverseGeocode(lat, lng) {
+      // Round to ~100m grid to improve cache hits
+      const key = `${lat.toFixed(3)},${lng.toFixed(3)}`;
+      if (geocodeCache[key]) return geocodeCache[key];
+
+      return new Promise((resolve) => {
+        geocodeQueue.push({ lat, lng, key, resolve });
+        processGeocodeQueue();
+      });
+    }
+
+    async function processGeocodeQueue() {
+      if (geocodeRunning || geocodeQueue.length === 0) return;
+      geocodeRunning = true;
+
+      while (geocodeQueue.length > 0) {
+        const { lat, lng, key, resolve } = geocodeQueue.shift();
+
+        // Check cache again (may have been resolved while queued)
+        if (geocodeCache[key]) { resolve(geocodeCache[key]); continue; }
+
+        try {
+          const res = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=16&addressdetails=1`, {
+            headers: { 'Accept-Language': 'en' },
+          });
+          const data = await res.json();
+          let place = '—';
+          if (data.address) {
+            const a = data.address;
+            place = a.road || a.neighbourhood || a.suburb || a.city_district || data.display_name?.split(',').slice(0, 2).join(',') || '—';
+          }
+          geocodeCache[key] = place;
+          resolve(place);
+        } catch {
+          resolve('—');
+        }
+
+        // Rate limit: wait 1s between requests
+        if (geocodeQueue.length > 0) {
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+
+      geocodeRunning = false;
+    }
+
+    function timeAgo(iso) {
+      const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+      if (diff < 10) return 'Just now';
+      if (diff < 60) return `${diff}s ago`;
+      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+      return `${Math.floor(diff / 3600)}h ago`;
+    }
+
+    function formatDuration(secs) {
+      if (secs < 60) return `${secs}s`;
+      if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      return `${h}h ${m}m`;
+    }
+
+    // ── Initial load ─────────────────────────────────────────
+    // Load active users with cursor-based pagination
+    async function loadActiveUsers() {
+      let cursor = '0';
+      try {
+        do {
+          const res = await fetch(`${BASE}/users/active?cursor=${cursor}&limit=50`);
+          const data = await res.json();
+          if (data.ok && data.data.length > 0) {
+            data.data.forEach(u => updateLiveUser(u));
+          }
+          cursor = data.cursor || '0';
+        } while (cursor !== '0');
+      } catch (err) {
+        console.error('Failed to load active users:', err);
+      }
+    }
+
+    loadActiveUsers();
+  </script>
+</body>
+</html>
