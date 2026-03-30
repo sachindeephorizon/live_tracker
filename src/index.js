@@ -54,7 +54,12 @@ app.use(express.json());
 // ── Health check ────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    pid: process.pid,
+    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
+  });
 });
 
 // ── Dashboard ────────────────────────────────────────────────────────
@@ -80,13 +85,14 @@ async function start() {
   // 3. Start listening
   server.listen(PORT, () => {
     console.log("═══════════════════════════════════════════════════");
-    console.log(`  Location Tracking Backend running on port ${PORT}`);
+    console.log(`  Worker ${process.pid} | Port ${PORT}`);
     console.log("  Endpoints:");
     console.log("    POST /:id/ping       → update user location");
     console.log("    GET  /user/:id       → fetch latest location");
     console.log("    GET  /users/active   → list active users");
     console.log("    GET  /health         → health check");
     console.log("    WS   /              → Socket.io (locationUpdate)");
+    console.log("  Scaling: Redis adapter ✓ | Rate limiter ✓");
     console.log("═══════════════════════════════════════════════════");
   });
 

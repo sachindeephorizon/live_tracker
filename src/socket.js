@@ -1,18 +1,24 @@
-
-
 const { Server } = require("socket.io");
-const { subscriber } = require("./redis");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const { subscriber, ioPub, ioSub } = require("./redis");
 
 const CHANNEL = "location_updates";
 
 function initSocket(httpServer) {
   const io = new Server(httpServer, {
     cors: {
-      origin: "*", // TODO: lock down to specific dashboard origins in production
+      origin: "*",
       methods: ["GET", "POST"],
     },
+    // Performance tuning for 10k+ connections
+    pingTimeout: 30000,
+    pingInterval: 25000,
+    transports: ["websocket"], // skip HTTP long-polling
   });
 
+  // ── Redis adapter — syncs Socket.io across multiple server instances ──
+  io.adapter(createAdapter(ioPub, ioSub));
+  console.log("[Socket.io] Redis adapter attached (horizontal scaling ready)");
 
   io.on("connection", (socket) => {
     console.log(`[Socket.io] Client connected   | id=${socket.id}`);
@@ -22,13 +28,10 @@ function initSocket(httpServer) {
     });
   });
 
-
+  // ── Redis Pub/Sub → broadcast to all WebSocket clients ──
   subscriber.subscribe(CHANNEL, (message) => {
     try {
       const data = JSON.parse(message);
-      console.log(`[PubSub] Broadcasting location for userId=${data.userId}`);
-
-      // Emit to every connected WebSocket client (agents)
       io.emit("locationUpdate", data);
     } catch (err) {
       console.error("[PubSub] Failed to parse message:", err.message);

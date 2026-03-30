@@ -2,18 +2,21 @@
 const { Router } = require("express");
 const { redis } = require("../redis");
 const { pool } = require("../db");
+const { processLocation, getUserState, clearUserState, haversineDistance } = require("../gps");
+const { rateLimitPing } = require("../rateLimit");
 const router = Router();
 const LOCATION_TTL = 60;
+const TRAIL_MIN_DISTANCE = 5; // meters — minimum distance between trail dots
 
 const CHANNEL = "location_updates";
 const ACTIVE_SET = "active_users";
 
 // ── POST /:id/ping ──────────────────────────────────────────────────
 
-router.post("/:id/ping", async (req, res) => {
+router.post("/:id/ping", rateLimitPing, async (req, res) => {
   try {
     const userId = req.params.id;
-    const { lat, lng, speed } = req.body;
+    const { lat, lng, speed, accuracy, timestamp } = req.body;
     if (!userId || typeof userId !== "string") {
       return res.status(400).json({ error: "Invalid user id" });
     }
@@ -27,22 +30,81 @@ router.post("/:id/ping", async (req, res) => {
       return res.status(400).json({ error: "lng must be between -180 and 180" });
     }
 
-    const now = new Date().toISOString();
     const userSpeed = typeof speed === "number" ? speed : null;
-    const payload = { userId, lat, lng, speed: userSpeed, timestamp: now };
+    const userAccuracy = typeof accuracy === "number" ? accuracy : null;
+    const userTimestamp = typeof timestamp === "number" ? timestamp : null;
+
+    // ── GPS filtering (Comprehensive GPS fixes applied) ──────
+    const state = getUserState(userId);
+    const processed = processLocation(lat, lng, userSpeed, state.prev, state.kalman, userAccuracy, userTimestamp, userId);
+
+    if (!processed) {
+      // Rejected as noise/spike — don't store or broadcast
+      return res.status(200).json({ ok: true, filtered: true, reason: "GPS spike rejected" });
+    }
+
+    const isFirstPing = !state.prev;
+    state.prev = processed;
+
+    const now = new Date().toISOString();
     const redisKey = `user:${userId}`;
     const sessionStartKey = `session:${userId}:start`;
     const sessionLogsKey = `session:${userId}:logs`;
+    const trailKey = `trail:${userId}`;
+    const startMarkerKey = `marker:${userId}:start`;
 
-    const locationPoint = JSON.stringify({ lat, lng, speed: userSpeed, timestamp: now });
+    // ── Trail dot logic (only when moving, min distance apart) ────
+    let addTrailDot = false;
+    if (processed.speed > 0.5) {
+      const lastDotRaw = await redis.lIndex(trailKey, -1);
+      if (!lastDotRaw) {
+        addTrailDot = true;
+      } else {
+        const lastDot = JSON.parse(lastDotRaw);
+        const d = haversineDistance(lastDot.lat, lastDot.lng, processed.latitude, processed.longitude);
+        if (d >= TRAIL_MIN_DISTANCE) addTrailDot = true;
+      }
+    }
 
-    await Promise.all([
+    const payload = {
+      userId,
+      lat: processed.latitude,
+      lng: processed.longitude,
+      speed: processed.speed,
+      bearing: processed.bearing,
+      activity: processed.activity,
+      timestamp: now,
+    };
+
+    const locationPoint = JSON.stringify({
+      lat: processed.latitude,
+      lng: processed.longitude,
+      speed: processed.speed,
+      activity: processed.activity,
+      timestamp: now,
+    });
+
+    const redisOps = [
       redis.setEx(redisKey, LOCATION_TTL, JSON.stringify(payload)),
       redis.sAdd(ACTIVE_SET, userId),
       redis.publish(CHANNEL, JSON.stringify(payload)),
       redis.set(sessionStartKey, now, { NX: true }),
       redis.rPush(sessionLogsKey, locationPoint),
-    ]);
+    ];
+
+    // Store start marker on first ping
+    if (isFirstPing) {
+      const startMarker = JSON.stringify({ lat: processed.latitude, lng: processed.longitude, timestamp: now });
+      redisOps.push(redis.set(startMarkerKey, startMarker));
+    }
+
+    // Store trail dot
+    if (addTrailDot) {
+      const trailDot = JSON.stringify({ lat: processed.latitude, lng: processed.longitude, timestamp: now });
+      redisOps.push(redis.rPush(trailKey, trailDot));
+    }
+
+    await Promise.all(redisOps);
 
     return res.status(200).json({ ok: true, data: payload });
   } catch (err) {
@@ -59,10 +121,14 @@ router.post("/:id/stop", async (req, res) => {
     const now = new Date();
     const sessionStartKey = `session:${userId}:start`;
     const sessionLogsKey = `session:${userId}:logs`;
+    const trailKey = `trail:${userId}`;
+    const startMarkerKey = `marker:${userId}:start`;
 
-    const [startedAt, logs] = await Promise.all([
+    const [startedAt, logs, trailDots, startMarkerRaw] = await Promise.all([
       redis.get(sessionStartKey),
       redis.lRange(sessionLogsKey, 0, -1),
+      redis.lRange(trailKey, 0, -1),
+      redis.get(startMarkerKey),
     ]);
 
     const countResult = await pool.query(
@@ -105,10 +171,21 @@ router.post("/:id/stop", async (req, res) => {
       `[POST /${userId}/stop] Flushed: ${sessionName} | ${parsedLogs.length} points | ${durationSecs}s`
     );
 
+    // Clear GPS filter state for this user
+    clearUserState(userId);
+
+    // Build stop marker
+    const lastLog = parsedLogs[parsedLogs.length - 1];
+    const stopMarker = lastLog ? { lat: lastLog.lat, lng: lastLog.lng } : null;
+    const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) : null;
+    const parsedTrail = trailDots.map((d) => JSON.parse(d));
+
     await Promise.all([
       redis.del(`user:${userId}`),
       redis.del(sessionStartKey),
       redis.del(sessionLogsKey),
+      redis.del(trailKey),
+      redis.del(startMarkerKey),
       redis.sRem(ACTIVE_SET, userId),
       redis.publish(CHANNEL, JSON.stringify({ userId, stopped: true })),
     ]);
@@ -119,6 +196,9 @@ router.post("/:id/stop", async (req, res) => {
         id: sessionId, name: sessionName, userId,
         startedAt: sessionStart, endedAt: now,
         durationSecs, totalPings: parsedLogs.length,
+        startMarker,
+        stopMarker,
+        trail: parsedTrail,
       },
     });
   } catch (err) {
@@ -224,6 +304,28 @@ router.get("/user/:id", async (req, res) => {
     return res.status(200).json({ ok: true, data: JSON.parse(raw) });
   } catch (err) {
     console.error("[GET /user/:id] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── GET /user/:id/trail ──────────────────────────────────────────────
+// Returns trail dots + start marker for an active user.
+
+router.get("/user/:id/trail", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [trailDots, startMarkerRaw] = await Promise.all([
+      redis.lRange(`trail:${id}`, 0, -1),
+      redis.get(`marker:${id}:start`),
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      startMarker: startMarkerRaw ? JSON.parse(startMarkerRaw) : null,
+      trail: trailDots.map((d) => JSON.parse(d)),
+    });
+  } catch (err) {
+    console.error("[GET /user/:id/trail] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
