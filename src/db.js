@@ -61,28 +61,21 @@ async function connectDB() {
         ended_at      TIMESTAMPTZ NOT NULL,
         duration_secs INTEGER NOT NULL,
         total_pings   INTEGER NOT NULL DEFAULT 0,
-        avg_speed_kmh DOUBLE PRECISION DEFAULT 0,
-        max_speed_kmh DOUBLE PRECISION DEFAULT 0,
+        start_location VARCHAR(255),
+        end_location   VARCHAR(255),
         created_at    TIMESTAMPTZ DEFAULT NOW()
       );
 
-      -- FIX: Add speed columns to existing sessions tables that were created
-      -- before this migration. ALTER TABLE ... ADD COLUMN IF NOT EXISTS is safe
-      -- to run repeatedly — it does nothing if the column already exists.
-      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS avg_speed_kmh DOUBLE PRECISION DEFAULT 0;
-      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS max_speed_kmh DOUBLE PRECISION DEFAULT 0;
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS start_location VARCHAR(255);
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_location VARCHAR(255);
 
       CREATE TABLE IF NOT EXISTS location_logs (
         id          SERIAL PRIMARY KEY,
         session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         lat         DOUBLE PRECISION NOT NULL,
         lng         DOUBLE PRECISION NOT NULL,
-        speed       DOUBLE PRECISION,
         recorded_at TIMESTAMPTZ NOT NULL
       );
-
-      -- Add speed column if table already exists without it
-      ALTER TABLE location_logs ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION;
 
       CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_location_logs_session_id ON location_logs(session_id);

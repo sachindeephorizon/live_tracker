@@ -2,6 +2,7 @@ const { Router } = require("express");
 const { redis } = require("../redis");
 const { pool } = require("../db");
 const { processLocation, getUserState, clearUserState, haversineDistance } = require("../gps");
+const { reverseGeocode } = require("../geocode");
 const { rateLimitPing } = require("../rateLimit");
 const router = Router();
 
@@ -23,7 +24,7 @@ const ACTIVE_SET = "active_users";
 router.post("/:id/ping", rateLimitPing, async (req, res) => {
   try {
     const userId = req.params.id;
-    const { lat, lng, speed, accuracy, timestamp } = req.body;
+    const { lat, lng, accuracy, timestamp } = req.body;
     if (!userId || typeof userId !== "string") {
       return res.status(400).json({ error: "Invalid user id" });
     }
@@ -37,14 +38,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       return res.status(400).json({ error: "lng must be between -180 and 180" });
     }
 
-    const userSpeed = typeof speed === "number" ? speed : null;
     const userAccuracy = typeof accuracy === "number" ? accuracy : null;
     const userTimestamp = typeof timestamp === "number" ? timestamp : null;
 
     // ── GPS filtering ──────────────────────────────────────────────
     const state = getUserState(userId);
-    // FIX: pass state as last argument so gps.js uses per-user smoothing
-    const processed = processLocation(lat, lng, userSpeed, state.prev, state.kalman, userAccuracy, userTimestamp, userId, state);
+    const processed = processLocation(lat, lng, state.prev, state.kalman, userAccuracy, userTimestamp, state);
 
     if (!processed) {
       // Rejected as noise/spike — don't store or broadcast
@@ -63,32 +62,25 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     // ── Trail dot logic (only when moving, min distance apart) ────
     let addTrailDot = false;
-    if (processed.speed > 0.5) {
-      const lastDotRaw = await redis.lIndex(trailKey, -1);
-      if (!lastDotRaw) {
-        addTrailDot = true;
-      } else {
-        const lastDot = JSON.parse(lastDotRaw);
-        const d = haversineDistance(lastDot.lat, lastDot.lng, processed.latitude, processed.longitude);
-        if (d >= TRAIL_MIN_DISTANCE) addTrailDot = true;
-      }
+    const lastDotRaw = await redis.lIndex(trailKey, -1);
+    if (!lastDotRaw) {
+      addTrailDot = true;
+    } else {
+      const lastDot = JSON.parse(lastDotRaw);
+      const d = haversineDistance(lastDot.lat, lastDot.lng, processed.latitude, processed.longitude);
+      if (d >= TRAIL_MIN_DISTANCE) addTrailDot = true;
     }
 
     const payload = {
       userId,
       lat: processed.latitude,
       lng: processed.longitude,
-      speed: processed.speed,
-      bearing: processed.bearing,
-      activity: processed.activity,
       timestamp: now,
     };
 
     const locationPoint = JSON.stringify({
       lat: processed.latitude,
       lng: processed.longitude,
-      speed: processed.speed,
-      activity: processed.activity,
       timestamp: now,
     });
 
@@ -98,8 +90,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       redis.publish(CHANNEL, JSON.stringify(payload)),
       redis.set(sessionStartKey, now, { NX: true }),
       redis.rPush(sessionLogsKey, locationPoint),
-      // FIX: Set TTL on session keys to prevent unbounded Redis memory growth.
-      // 1s pings = ~3600 entries/hour. Without TTL, long sessions fill Redis → 500 errors.
       redis.expire(sessionLogsKey, SESSION_TTL),
       redis.expire(trailKey, SESSION_TTL),
       redis.expire(sessionStartKey, SESSION_TTL),
@@ -156,26 +146,19 @@ router.post("/:id/stop", async (req, res) => {
     const durationSecs = Math.floor((now - sessionStart) / 1000);
     const parsedLogs = logs.map((l) => JSON.parse(l));
 
-    // FIX: Compute avg/max speed from filtered speed values stored in Redis logs.
-    // Previously these were never calculated — sessions table had no speed columns.
-    // Only include moving points (speed > 0.5 m/s) so stationary time doesn't
-    // drag avg speed down to near-zero, matching frontend behavior.
-    const movingPoints = parsedLogs.filter(p => typeof p.speed === 'number' && p.speed > 0.5);
-    const maxSpeed = movingPoints.length > 0
-      ? Math.max(...movingPoints.map(p => p.speed))
-      : 0;
-    const avgSpeed = movingPoints.length > 0
-      ? movingPoints.reduce((sum, p) => sum + p.speed, 0) / movingPoints.length
-      : 0;
-    // Convert m/s → km/h, round to 2 decimal places
-    const maxSpeedKmh = Math.round(maxSpeed * 3.6 * 100) / 100;
-    const avgSpeedKmh = Math.round(avgSpeed * 3.6 * 100) / 100;
+    // Geocode start and end locations (non-blocking — null on failure)
+    const firstLog = parsedLogs[0];
+    const lastLog = parsedLogs[parsedLogs.length - 1];
+    const [startLocation, endLocation] = await Promise.all([
+      firstLog ? reverseGeocode(firstLog.lat, firstLog.lng) : null,
+      lastLog ? reverseGeocode(lastLog.lat, lastLog.lng) : null,
+    ]);
 
     const sessionResult = await pool.query(
-      `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, avg_speed_kmh, max_speed_kmh)
+      `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
-      [userId, sessionName, sessionStart, now, durationSecs, parsedLogs.length, avgSpeedKmh, maxSpeedKmh]
+      [userId, sessionName, sessionStart, now, durationSecs, parsedLogs.length, startLocation, endLocation]
     );
     const sessionId = sessionResult.rows[0].id;
 
@@ -186,12 +169,12 @@ router.post("/:id/stop", async (req, res) => {
       const values = [];
       const params = [];
       batch.forEach((point, i) => {
-        const offset = i * 5;
-        values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`);
-        params.push(sessionId, point.lat, point.lng, point.speed ?? null, point.timestamp);
+        const offset = i * 4;
+        values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`);
+        params.push(sessionId, point.lat, point.lng, point.timestamp);
       });
       await pool.query(
-        `INSERT INTO location_logs (session_id, lat, lng, speed, recorded_at) VALUES ${values.join(", ")}`,
+        `INSERT INTO location_logs (session_id, lat, lng, recorded_at) VALUES ${values.join(", ")}`,
         params
       );
     }
@@ -204,8 +187,8 @@ router.post("/:id/stop", async (req, res) => {
     clearUserState(userId);
 
     // Build stop marker
-    const lastLog = parsedLogs[parsedLogs.length - 1];
-    const stopMarker = lastLog ? { lat: lastLog.lat, lng: lastLog.lng } : null;
+    const finalLog = parsedLogs[parsedLogs.length - 1];
+    const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
     const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) : null;
     const parsedTrail = trailDots.map((d) => JSON.parse(d));
 
@@ -225,10 +208,8 @@ router.post("/:id/stop", async (req, res) => {
         id: sessionId, name: sessionName, userId,
         startedAt: sessionStart, endedAt: now,
         durationSecs, totalPings: parsedLogs.length,
-        avgSpeedKmh,
-        maxSpeedKmh,
-        startMarker,
-        stopMarker,
+        startLocation, endLocation,
+        startMarker, stopMarker,
         trail: parsedTrail,
       },
     });
@@ -245,8 +226,6 @@ router.get("/users/active", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const cursor = req.query.cursor || "0";
 
-    // FIX: node-redis v4 sScan returns { cursor, members } object, NOT an array.
-    // Destructuring as array throws "is not iterable". Use object destructuring instead.
     const scanResult = await redis.sScan(ACTIVE_SET, cursor, { COUNT: limit });
     const nextCursor = scanResult.cursor;
     const userIds = scanResult.members;
@@ -299,7 +278,7 @@ router.get("/sessions/all", async (req, res) => {
     const [countResult, result] = await Promise.all([
       pool.query("SELECT COUNT(*) AS total FROM sessions"),
       pool.query(
-        `SELECT id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, avg_speed_kmh, max_speed_kmh, created_at
+        `SELECT id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location, created_at
          FROM sessions ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
         [limit, offset]
       ),
@@ -373,7 +352,7 @@ router.get("/user/:id/sessions", async (req, res) => {
     const [countResult, result] = await Promise.all([
       pool.query("SELECT COUNT(*) AS total FROM sessions WHERE user_id = $1", [id]),
       pool.query(
-        `SELECT id, session_name, started_at, ended_at, duration_secs, total_pings, avg_speed_kmh, max_speed_kmh, created_at
+        `SELECT id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location, created_at
          FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
         [id, limit, offset]
       ),
@@ -409,7 +388,7 @@ router.get("/session/:sessionId/logs", async (req, res) => {
     const [countResult, result] = await Promise.all([
       pool.query("SELECT COUNT(*) AS total FROM location_logs WHERE session_id = $1", [sid]),
       pool.query(
-        `SELECT lat, lng, speed, recorded_at FROM location_logs
+        `SELECT lat, lng, recorded_at FROM location_logs
          WHERE session_id = $1 ORDER BY recorded_at ASC LIMIT $2 OFFSET $3`,
         [sid, limit, offset]
       ),
@@ -427,6 +406,32 @@ router.get("/session/:sessionId/logs", async (req, res) => {
     });
   } catch (err) {
     console.error("[GET /session/:id/logs] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── DELETE /session/:sessionId ──────────────────────────────────────
+
+router.delete("/session/:sessionId", async (req, res) => {
+  try {
+    const sid = parseInt(req.params.sessionId, 10);
+    if (isNaN(sid)) {
+      return res.status(400).json({ error: "Invalid session id" });
+    }
+
+    // location_logs are cascade-deleted via FK constraint
+    const result = await pool.query(
+      "DELETE FROM sessions WHERE id = $1 RETURNING id",
+      [sid]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    return res.status(200).json({ ok: true, deleted: sid });
+  } catch (err) {
+    console.error("[DELETE /session/:id] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
   }
 });

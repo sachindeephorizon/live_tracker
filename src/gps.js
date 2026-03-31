@@ -1,13 +1,9 @@
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  Server-side GPS filtering — mirrors frontend logic exactly.
+ *  Server-side GPS filtering — smooths noisy coordinates.
  * ═══════════════════════════════════════════════════════════════════
  *
- * FIX: Removed 3 global variables (previousLocation, previousTimestamp,
- * smoothedLocation) that were shared across ALL users. When User A sent
- * a ping it overwrote the smoothing state for User B, corrupting GPS
- * output for every user except the last one to ping.
- * These are now stored per-user inside getUserState().
+ * Per-user state so each user has isolated smoothing (no cross-talk).
  */
 
 const MAX_SPEED_MS = 50;          // ~180 km/h — reject anything faster
@@ -15,23 +11,6 @@ const STATIONARY_THRESHOLD = 3;   // meters — ignore drift below this
 const MAX_JUMP_DIST = 100;        // meters — reject teleports
 const MAX_DT = 5;                 // seconds — clamp time gap
 const ACCURACY_THRESHOLD = 30;    // meters — reject GPS >30m accuracy
-
-// Adaptive accuracy based on speed
-const getAdaptiveAccuracyThreshold = (speed) => {
-  if (speed < 2) return 20;
-  if (speed < 10) return 30;
-  if (speed < 30) return 50;
-  return 100;
-};
-
-// Activity detection based on speed
-const detectActivity = (speed, prevSpeed = 0) => {
-  if (speed < 0.5) return 'stationary';
-  if (speed < 3) return 'walking';
-  if (speed < 15) return 'cycling';
-  if (speed < 40) return 'driving';
-  return 'high_speed';
-};
 
 // ── 2D Kalman Filter ────────────────────────────────────────────────
 class KalmanFilter2D {
@@ -93,22 +72,13 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 // ── Process Location ────────────────────────────────────────────────
-// FIX: smoothedLocation and previousLocation are now passed in as part
-// of userState (per-user) instead of being global variables shared
-// across all users. Each user has their own isolated smoothing state.
-function processLocation(newLat, newLng, speed, prevEntry, kalman, accuracy = null, timestamp = null, userId = null, userState = null) {
+function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, timestamp = null, userState = null) {
   if (typeof newLat !== 'number' || typeof newLng !== 'number' ||
       newLat < -90 || newLat > 90 || newLng < -180 || newLng > 180) {
     return null;
   }
 
-  // Adaptive accuracy threshold based on previous speed
-  let adaptiveAccuracyThreshold = ACCURACY_THRESHOLD;
-  if (prevEntry && prevEntry.speed !== undefined) {
-    adaptiveAccuracyThreshold = getAdaptiveAccuracyThreshold(prevEntry.speed);
-  }
-
-  if (accuracy !== null && accuracy > adaptiveAccuracyThreshold) {
+  if (accuracy !== null && accuracy > ACCURACY_THRESHOLD) {
     return null;
   }
 
@@ -119,12 +89,9 @@ function processLocation(newLat, newLng, speed, prevEntry, kalman, accuracy = nu
     const initialLocation = {
       latitude: filtered[0],
       longitude: filtered[1],
-      speed: 0,
       timestamp: now,
-      activity: 'stationary',
     };
 
-    // FIX: Store in per-user state, not globals
     if (userState) {
       userState.smoothedLocation = { latitude: newLat, longitude: newLng };
       userState.previousLocation = { latitude: newLat, longitude: newLng };
@@ -153,10 +120,9 @@ function processLocation(newLat, newLng, speed, prevEntry, kalman, accuracy = nu
   );
 
   if (filteredDist < STATIONARY_THRESHOLD) {
-    return { ...prevEntry, speed: 0, timestamp: now, activity: 'stationary' };
+    return { ...prevEntry, timestamp: now };
   }
 
-  // FIX: Use per-user smoothedLocation instead of global
   let finalLat = filteredLat;
   let finalLng = filteredLng;
   const smoothedLocation = userState ? userState.smoothedLocation : null;
@@ -167,26 +133,18 @@ function processLocation(newLat, newLng, speed, prevEntry, kalman, accuracy = nu
     finalLng = smoothedLocation.longitude * (1 - weight) + filteredLng * weight;
   }
 
-  // FIX: Update per-user smoothed location
   if (userState) {
     userState.smoothedLocation = { latitude: finalLat, longitude: finalLng };
   }
 
-  // FIX: Use per-user previousLocation instead of global
   const previousLocation = userState ? userState.previousLocation : null;
-  const speedDist = previousLocation ?
+  const moveDist = previousLocation ?
     haversineDistance(previousLocation.latitude, previousLocation.longitude, finalLat, finalLng) :
     filteredDist;
 
-  let computedSpeed = speedDist / dt;
-
+  const computedSpeed = moveDist / dt;
   if (computedSpeed > MAX_SPEED_MS) return null;
-  if (speedDist < STATIONARY_THRESHOLD) computedSpeed = 0;
-  if (computedSpeed < 0.1) computedSpeed = 0;
 
-  const activity = detectActivity(computedSpeed, prevEntry.speed);
-
-  // FIX: Update per-user previous location
   if (userState) {
     userState.previousLocation = { latitude: finalLat, longitude: finalLng };
     userState.previousTimestamp = now;
@@ -195,15 +153,11 @@ function processLocation(newLat, newLng, speed, prevEntry, kalman, accuracy = nu
   return {
     latitude: finalLat,
     longitude: finalLng,
-    speed: computedSpeed,
     timestamp: now,
-    activity,
   };
 }
 
 // ── Per-user state cache ────────────────────────────────────────────
-// FIX: Added smoothedLocation, previousLocation, previousTimestamp
-// to per-user state so they are never shared between users.
 const userStates = new Map();
 
 function getUserState(userId) {
@@ -211,9 +165,6 @@ function getUserState(userId) {
     userStates.set(userId, {
       prev: null,
       kalman: new KalmanFilter2D(),
-      activity: 'unknown',
-      speedHistory: [],
-      // FIX: these were global before — now isolated per user
       smoothedLocation: null,
       previousLocation: null,
       previousTimestamp: null,
