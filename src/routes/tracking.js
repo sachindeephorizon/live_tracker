@@ -38,6 +38,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       return res.status(200).json({ ok: true, filtered: true, reason: "GPS spike rejected" });
     }
 
+    // Detect real movement — if position unchanged from previous, it's stationary
+    const prevState = state.prev;
+    const isRealMovement = !prevState ||
+      prevState.latitude !== processed.latitude ||
+      prevState.longitude !== processed.longitude;
+
     state.prev = processed;
 
     const now = new Date().toISOString();
@@ -80,8 +86,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const redisOps = [
       redis.setEx(redisKey, LOCATION_TTL, JSON.stringify(payload)),
       redis.sAdd(ACTIVE_SET, userId),
-      redis.publish(CHANNEL, JSON.stringify(payload)),
     ];
+
+    // Only emit to dashboard when there's real movement or first ping
+    if (isRealMovement || isFirstPing) {
+      redisOps.push(redis.publish(CHANNEL, JSON.stringify(payload)));
+    }
 
     if (isFirstPing) {
       // If there's leftover session data from a previous session that was

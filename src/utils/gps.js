@@ -7,7 +7,7 @@
  */
 
 const MAX_SPEED_MS = 50;          // ~180 km/h — reject anything faster
-const STATIONARY_THRESHOLD = 3;   // meters — ignore drift below this
+const STATIONARY_THRESHOLD = 5;   // meters — ignore drift below this
 const MAX_JUMP_DIST = 100;        // meters — reject teleports
 const MAX_DT = 5;                 // seconds — clamp time gap
 const ACCURACY_THRESHOLD = 30;    // meters — reject GPS >30m accuracy
@@ -20,12 +20,24 @@ class KalmanFilter2D {
     this.P = 1;
     this.Q = 0.01;
     this.R = 0.0001;
+    this.stationaryCount = 0;
   }
 
-  update(measurement, dt) {
+  update(measurement, dt, isStationary = false) {
     if (!this.x) {
       this.x = measurement;
       return this.x;
+    }
+
+    if (isStationary) {
+      this.stationaryCount++;
+      if (this.stationaryCount >= 3) {
+        this.v = [0, 0];
+      } else {
+        this.v = [this.v[0] * 0.2, this.v[1] * 0.2];
+      }
+    } else {
+      this.stationaryCount = 0;
     }
 
     this.x = [
@@ -40,7 +52,7 @@ class KalmanFilter2D {
       this.x[1] + K * (measurement[1] - this.x[1]),
     ];
 
-    if (dt > 0) {
+    if (dt > 0 && !isStationary) {
       this.v = [
         (measurement[0] - this.x[0]) / dt,
         (measurement[1] - this.x[1]) / dt,
@@ -56,6 +68,7 @@ class KalmanFilter2D {
     this.x = null;
     this.v = [0, 0];
     this.P = 1;
+    this.stationaryCount = 0;
   }
 }
 
@@ -110,7 +123,15 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
   const teleportSpeed = rawDist / dt;
   if (teleportSpeed > MAX_SPEED_MS) return null;
 
-  const filtered = kalman.update([newLat, newLng], dt);
+  // Check raw distance for stationary detection before Kalman
+  const isStationary = rawDist < STATIONARY_THRESHOLD;
+
+  if (isStationary) {
+    kalman.update([prevEntry.latitude, prevEntry.longitude], dt, true);
+    return { ...prevEntry, timestamp: now };
+  }
+
+  const filtered = kalman.update([newLat, newLng], dt, false);
   const filteredLat = filtered[0];
   const filteredLng = filtered[1];
 
