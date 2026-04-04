@@ -33,7 +33,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const userTimestamp = typeof timestamp === "number" ? timestamp : null;
 
     const state = getUserState(userId);
-    const processed = processLocation(lat, lng, state.prev, state.kalman, userAccuracy, userTimestamp, state);
+    const processed = processLocation(lat, lng, state.prev, state.kalman, userAccuracy, userTimestamp);
 
     if (!processed) {
       return res.status(200).json({ ok: true, filtered: true, reason: "GPS spike rejected" });

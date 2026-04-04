@@ -1,16 +1,15 @@
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  Server-side GPS filtering — smooths noisy coordinates.
+ *  Server-side GPS filtering — mirrors frontend logic.
+ *  Kalman filter only, no sliding window or extra smoothing.
  * ═══════════════════════════════════════════════════════════════════
- *
- * Per-user state so each user has isolated smoothing (no cross-talk).
  */
 
-const MAX_SPEED_MS = 50;          // ~180 km/h — reject anything faster
-const STATIONARY_THRESHOLD = 5;   // meters — ignore drift below this
-const MAX_JUMP_DIST = 100;        // meters — reject teleports
-const MAX_DT = 5;                 // seconds — clamp time gap
-const ACCURACY_THRESHOLD = 20;    // meters — reject GPS >20m accuracy
+const MAX_SPEED_MS = 70;          // ~252 km/h — match frontend
+const STATIONARY_THRESHOLD = 2;   // meters — match frontend MIN_MOVEMENT
+const MAX_JUMP_DIST = 500;        // meters — match frontend MAX_JUMP
+const MAX_DT = 10;                // seconds — clamp time gap
+const ACCURACY_THRESHOLD = 100;   // meters — match frontend MAX_ACCURACY
 
 // ── 2D Kalman Filter ────────────────────────────────────────────────
 class KalmanFilter2D {
@@ -18,14 +17,14 @@ class KalmanFilter2D {
     this.x = null;
     this.v = [0, 0];
     this.P = 1;
-    this.Q = 0.01;
+    this.Q = 0.00001;
     this.R = 0.0001;
     this.stationaryCount = 0;
   }
 
-  update(measurement, dt, isStationary = false) {
+  update(measurement, dt, accuracy, isStationary = false) {
     if (!this.x) {
-      this.x = measurement;
+      this.x = [...measurement];
       return this.x;
     }
 
@@ -40,27 +39,28 @@ class KalmanFilter2D {
       this.stationaryCount = 0;
     }
 
-    this.x = [
+    const predicted = [
       this.x[0] + this.v[0] * dt,
       this.x[1] + this.v[1] * dt,
     ];
+    const predictedP = this.P + this.Q;
 
-    const K = this.P / (this.P + this.R);
+    const adaptiveR = this.R * Math.max(1, accuracy / 5);
+    const K = predictedP / (predictedP + adaptiveR);
 
     this.x = [
-      this.x[0] + K * (measurement[0] - this.x[0]),
-      this.x[1] + K * (measurement[1] - this.x[1]),
+      predicted[0] + K * (measurement[0] - predicted[0]),
+      predicted[1] + K * (measurement[1] - predicted[1]),
     ];
 
     if (dt > 0 && !isStationary) {
       this.v = [
-        (measurement[0] - this.x[0]) / dt,
-        (measurement[1] - this.x[1]) / dt,
+        (this.x[0] - predicted[0] + this.v[0] * dt) / dt,
+        (this.x[1] - predicted[1] + this.v[1] * dt) / dt,
       ];
     }
 
-    this.P = (1 - K) * this.P + this.Q;
-
+    this.P = (1 - K) * predictedP;
     return this.x;
   }
 
@@ -84,34 +84,27 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ── Process Location ────────────────────────────────────────────────
-function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, timestamp = null, userState = null) {
+// ── Process Location — matches frontend processLocation exactly ────
+function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, timestamp = null) {
   if (typeof newLat !== 'number' || typeof newLng !== 'number' ||
       newLat < -90 || newLat > 90 || newLng < -180 || newLng > 180) {
     return null;
   }
 
-  if (accuracy !== null && accuracy > ACCURACY_THRESHOLD) {
-    return null;
-  }
+  const normalizedAccuracy = (typeof accuracy === 'number' && isFinite(accuracy))
+    ? accuracy : ACCURACY_THRESHOLD;
+
+  if (normalizedAccuracy <= 0 || normalizedAccuracy > ACCURACY_THRESHOLD) return null;
 
   const now = timestamp || Date.now();
 
   if (!prevEntry) {
-    const filtered = kalman.update([newLat, newLng], 1);
-    const initialLocation = {
+    const filtered = kalman.update([newLat, newLng], 1, normalizedAccuracy);
+    return {
       latitude: filtered[0],
       longitude: filtered[1],
       timestamp: now,
     };
-
-    if (userState) {
-      userState.smoothedLocation = { latitude: newLat, longitude: newLng };
-      userState.previousLocation = { latitude: newLat, longitude: newLng };
-      userState.previousTimestamp = now;
-    }
-
-    return initialLocation;
   }
 
   const dt = Math.min((now - prevEntry.timestamp) / 1000, MAX_DT);
@@ -120,107 +113,33 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
   const rawDist = haversineDistance(prevEntry.latitude, prevEntry.longitude, newLat, newLng);
   if (rawDist > MAX_JUMP_DIST) return null;
 
-  const teleportSpeed = rawDist / dt;
-  if (teleportSpeed > MAX_SPEED_MS) return null;
+  const rawSpeed = rawDist / dt;
+  if (rawSpeed > MAX_SPEED_MS) return null;
 
-  // Scale stationary threshold by accuracy — worse GPS = higher bar
-  const dynamicThreshold = accuracy !== null
-    ? Math.max(STATIONARY_THRESHOLD, accuracy * 0.8)
-    : STATIONARY_THRESHOLD;
-  const isStationary = rawDist < dynamicThreshold;
+  // Dynamic stationary threshold — match frontend
+  const dynamicMinMovement = Math.max(STATIONARY_THRESHOLD, normalizedAccuracy * 0.25);
 
-  if (isStationary) {
-    kalman.update([prevEntry.latitude, prevEntry.longitude], dt, true);
+  if (rawDist < dynamicMinMovement) {
+    kalman.update([prevEntry.latitude, prevEntry.longitude], dt, normalizedAccuracy, true);
     return { ...prevEntry, timestamp: now };
   }
 
-  const filtered = kalman.update([newLat, newLng], dt, false);
-  let filteredLat = filtered[0];
-  let filteredLng = filtered[1];
-
-  // Multi-point smoothing — sliding window average after Kalman
-  if (userState && userState.window) {
-    userState.window.push(filteredLat, filteredLng);
-    const avg = userState.window.average();
-    filteredLat = avg.lat;
-    filteredLng = avg.lng;
-  }
+  // Kalman filter only — no sliding window, no extra smoothing
+  const filtered = kalman.update([newLat, newLng], dt, normalizedAccuracy, false);
 
   const filteredDist = haversineDistance(
     prevEntry.latitude, prevEntry.longitude,
-    filteredLat, filteredLng
+    filtered[0], filtered[1]
   );
 
-  if (filteredDist < dynamicThreshold) {
-    return { ...prevEntry, timestamp: now };
-  }
-
-  let finalLat = filteredLat;
-  let finalLng = filteredLng;
-  const smoothedLocation = userState ? userState.smoothedLocation : null;
-
-  if (smoothedLocation) {
-    const weight = 0.3;
-    finalLat = smoothedLocation.latitude * (1 - weight) + filteredLat * weight;
-    finalLng = smoothedLocation.longitude * (1 - weight) + filteredLng * weight;
-  }
-
-  if (userState) {
-    userState.smoothedLocation = { latitude: finalLat, longitude: finalLng };
-  }
-
-  const previousLocation = userState ? userState.previousLocation : null;
-  const moveDist = previousLocation ?
-    haversineDistance(previousLocation.latitude, previousLocation.longitude, finalLat, finalLng) :
-    filteredDist;
-
-  const computedSpeed = moveDist / dt;
-  if (computedSpeed > MAX_SPEED_MS) return null;
-
-  if (userState) {
-    userState.previousLocation = { latitude: finalLat, longitude: finalLng };
-    userState.previousTimestamp = now;
-  }
+  const speed = filteredDist / dt;
+  if (speed > MAX_SPEED_MS) return null;
 
   return {
-    latitude: finalLat,
-    longitude: finalLng,
+    latitude: filtered[0],
+    longitude: filtered[1],
     timestamp: now,
   };
-}
-
-// ── Sliding Window for multi-point smoothing ───────────────────────
-class SlidingWindow {
-  constructor(size = 5) {
-    this.size = size;
-    this.buffer = [];
-  }
-
-  push(lat, lng) {
-    this.buffer.push({ lat, lng });
-    if (this.buffer.length > this.size) this.buffer.shift();
-  }
-
-  average() {
-    const len = this.buffer.length;
-    if (len === 0) return null;
-    if (len === 1) return { lat: this.buffer[0].lat, lng: this.buffer[0].lng };
-
-    let totalWeight = 0;
-    let latSum = 0;
-    let lngSum = 0;
-    for (let i = 0; i < len; i++) {
-      const weight = i + 1;
-      latSum += this.buffer[i].lat * weight;
-      lngSum += this.buffer[i].lng * weight;
-      totalWeight += weight;
-    }
-    return { lat: latSum / totalWeight, lng: lngSum / totalWeight };
-  }
-
-  reset() {
-    this.buffer = [];
-  }
 }
 
 // ── Per-user state cache ────────────────────────────────────────────
@@ -231,10 +150,6 @@ function getUserState(userId) {
     userStates.set(userId, {
       prev: null,
       kalman: new KalmanFilter2D(),
-      window: new SlidingWindow(),
-      smoothedLocation: null,
-      previousLocation: null,
-      previousTimestamp: null,
     });
   }
   return userStates.get(userId);

@@ -42,6 +42,9 @@ router.get("/all", async (req, res) => {
 router.get("/:sessionId/logs", async (req, res) => {
   try {
     const sid = parseInt(req.params.sessionId, 10);
+    if (isNaN(sid)) {
+      return res.status(400).json({ error: "Invalid session id" });
+    }
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(parseInt(req.query.limit) || 500, 2000);
     const offset = (page - 1) * limit;
