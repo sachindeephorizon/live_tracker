@@ -20,16 +20,39 @@ router.get("/active", async (req, res) => {
       return res.status(200).json({ ok: true, data: [], cursor: "0", hasMore: false });
     }
 
-    const keys = userIds.map((id) => `user:${id}`);
-    const values = await redis.mGet(keys);
+    const locationKeys = userIds.map((id) => `user:${id}`);
+    const sessionKeys = userIds.map((id) => `session:${id}:start`);
+
+    const [locationValues, sessionValues] = await Promise.all([
+      redis.mGet(locationKeys),
+      redis.mGet(sessionKeys),
+    ]);
 
     const users = [];
     const staleIds = [];
 
     for (let i = 0; i < userIds.length; i++) {
-      if (values[i]) {
-        users.push(JSON.parse(values[i]));
+      const hasLocation = !!locationValues[i];
+      const hasSession = !!sessionValues[i];
+
+      if (hasLocation) {
+        // Normal case — location key fresh, use it directly
+        users.push(JSON.parse(locationValues[i]));
+      } else if (hasSession) {
+        // FIX: location key expired (screen off > 30min or brief gap)
+        // but session is still active (session key has 24hr TTL).
+        // Don't remove from ACTIVE_SET — user is still tracking.
+        // Return a placeholder so dashboard keeps showing them.
+        users.push({
+          userId: userIds[i],
+          lat: null,
+          lng: null,
+          timestamp: null,
+          startedAt: sessionValues[i],
+          stale: true, // dashboard can show "last seen" indicator
+        });
       } else {
+        // No location AND no session — truly stale, safe to remove
         staleIds.push(userIds[i]);
       }
     }
@@ -94,7 +117,6 @@ router.get("/:id/trail", async (req, res) => {
 });
 
 // ── GET /user/:id/session-distance ──────────────────────────────────
-// Calculates total distance from the active Redis session logs.
 
 router.get("/:id/session-distance", async (req, res) => {
   try {
@@ -111,7 +133,7 @@ router.get("/:id/session-distance", async (req, res) => {
     for (let i = 1; i < logs.length; i++) {
       const curr = JSON.parse(logs[i]);
       const d = haversineDistance(prev.lat, prev.lng, curr.lat, curr.lng);
-      if (d < 100) { // skip jumps > 100m (noise)
+      if (d < 100) {
         totalDistance += d;
       }
       prev = curr;
