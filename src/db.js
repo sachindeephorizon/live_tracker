@@ -90,6 +90,9 @@ async function connectDB() {
         stream_id   VARCHAR(64)
       );
 
+      -- Add stream_id column if table already exists without it
+      ALTER TABLE location_logs ADD COLUMN IF NOT EXISTS stream_id VARCHAR(64);
+
       -- For idempotency — prevent duplicate inserts from stream retries
       CREATE UNIQUE INDEX IF NOT EXISTS idx_location_logs_stream_id
         ON location_logs(stream_id) WHERE stream_id IS NOT NULL;
