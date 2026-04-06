@@ -12,7 +12,7 @@ const {
 } = require("../utils/gps");
 const { reverseGeocode } = require("../utils/geocode");
 const { rateLimitPing } = require("../utils/rateLimit");
-const { snapToRoad, snapTrajectory } = require("../utils/snapToRoad");
+const { snapTrajectory } = require("../utils/snapToRoad");
 const { LOCATION_TTL, SESSION_TTL, TRAIL_MIN_DISTANCE, CHANNEL, ACTIVE_SET } = require("../config");
 
 const router = Router();
@@ -36,18 +36,13 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const userAccuracy = typeof accuracy === "number" ? accuracy : null;
     const userTimestamp = typeof timestamp === "number" ? timestamp : null;
 
-    // Restore state from Redis if server restarted
     const state = await getUserState(userId);
 
-    // GAP DETECTION: if prev exists and gap > GAP_RESET_SECONDS,
-    // clear prev so processLocation treats it as a fresh start.
-    // This prevents filtering after screen-off, Doze, or server restart.
+    // Gap detection — same as frontend
     if (state.prev && userTimestamp) {
       const gapSeconds = (userTimestamp - state.prev.timestamp) / 1000;
       if (gapSeconds > GAP_RESET_SECONDS) {
-        console.log(
-          `[ping] Gap of ${gapSeconds.toFixed(0)}s detected for ${userId} — resetting state`
-        );
+        console.log(`[ping] Gap ${gapSeconds.toFixed(0)}s for ${userId} — resetting state`);
         state.prev = null;
         state.kalman.reset();
         state.filterStreak = 0;
@@ -60,47 +55,41 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     );
 
     if (!processed) {
-      // Filter streak — reset prev after N consecutive filtered points
       state.filterStreak = (state.filterStreak || 0) + 1;
-
       if (state.filterStreak >= MAX_FILTER_STREAK) {
-        console.warn(
-          `[ping] Filter streak ${state.filterStreak} for ${userId} — force resetting state`
-        );
+        console.warn(`[ping] Filter streak ${state.filterStreak} for ${userId} — resetting`);
         state.prev = null;
         state.kalman.reset();
         state.filterStreak = 0;
         await saveUserState(userId);
       }
-
-      return res.status(200).json({
-        ok: true,
-        filtered: true,
-        reason: "GPS spike rejected",
-        streak: state.filterStreak,
-      });
+      return res.status(200).json({ ok: true, filtered: true, reason: "GPS spike rejected" });
     }
 
-    // Successful processing — reset streak
     state.filterStreak = 0;
 
-    const prevState = state.prev;
     const isRealMovement =
-      !prevState ||
-      prevState.latitude !== processed.latitude ||
-      prevState.longitude !== processed.longitude;
+      !state.prev ||
+      state.prev.latitude !== processed.latitude ||
+      state.prev.longitude !== processed.longitude;
 
     state.prev = processed;
-
-    // Save state to Redis immediately — survives server restart
     await saveUserState(userId);
 
-    // Road snap — non-blocking
-    const snapped = isRealMovement
-      ? await snapToRoad(processed.latitude, processed.longitude)
-      : { lat: processed.latitude, lng: processed.longitude, snapped: false };
-    const finalLat = snapped.lat;
-    const finalLng = snapped.lng;
+    // FIX: Removed per-ping snapToRoad — it was the main cause of
+    // left/right zigzag and distance overcounting on flyovers.
+    //
+    // Per-ping snapping snaps each point independently to nearest road.
+    // On a flyover, OSRM alternates between flyover and ground road
+    // (both are ~30m away) → every ping jumps 30-60m sideways →
+    // distance overcounts by 2-3x (your 900m trip showed as 2.18km).
+    //
+    // snapTrajectory on /stop is far superior — it sees the whole path
+    // at once and finds the most consistent road sequence.
+    // Raw (Kalman-filtered) coordinates are stored in Redis logs.
+    // Final snapping happens only when session ends.
+    const finalLat = processed.latitude;
+    const finalLng = processed.longitude;
 
     const now = new Date().toISOString();
     const redisKey = `user:${userId}`;
@@ -145,7 +134,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     }
 
     if (isFirstPing) {
-      // Save orphan session if exists
       try {
         const [oldStart, oldLogs] = await Promise.all([
           redis.get(sessionStartKey),
@@ -160,7 +148,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
             "SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1", [userId]
           );
           const num = parseInt(countRes.rows[0].cnt, 10) + 1;
-          const oldName = `session${num}`;
           const firstOld = parsedOldLogs[0];
           const lastOld = parsedOldLogs[parsedOldLogs.length - 1];
           const [startLoc, endLoc] = await Promise.all([
@@ -170,7 +157,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
           const sResult = await pool.query(
             `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-            [userId, oldName, oldSessionStart, oldNow, oldDuration, parsedOldLogs.length, startLoc, endLoc]
+            [userId, `session${num}`, oldSessionStart, oldNow, oldDuration, parsedOldLogs.length, startLoc, endLoc]
           );
           const oldSid = sResult.rows[0].id;
           const BATCH = 500;
@@ -187,7 +174,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
               params
             );
           }
-          console.log(`[ping] Saved orphan session: ${oldName} | ${parsedOldLogs.length} pts`);
+          console.log(`[ping] Saved orphan session | ${parsedOldLogs.length} pts`);
         }
       } catch (e) {
         console.error("[ping] Failed to save orphan session:", e.message);
@@ -199,10 +186,9 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       redisOps.push(redis.expire(sessionStartKey, SESSION_TTL));
       redisOps.push(redis.rPush(sessionLogsKey, locationPoint));
       redisOps.push(redis.expire(sessionLogsKey, SESSION_TTL));
-      const startMarker = JSON.stringify({
+      redisOps.push(redis.set(startMarkerKey, JSON.stringify({
         lat: processed.latitude, lng: processed.longitude, timestamp: now,
-      });
-      redisOps.push(redis.set(startMarkerKey, startMarker));
+      })));
       redisOps.push(redis.expire(startMarkerKey, SESSION_TTL));
     } else {
       redisOps.push(redis.rPush(sessionLogsKey, locationPoint));
@@ -260,6 +246,18 @@ router.post("/:id/stop", async (req, res) => {
       lastLog ? reverseGeocode(lastLog.lat, lastLog.lng) : null,
     ]);
 
+    // Calculate distance from raw Kalman-filtered logs (before snapping)
+    // This gives accurate distance without snap-induced zigzag errors
+    let totalDistanceM = 0;
+    for (let i = 1; i < parsedLogs.length; i++) {
+      const d = haversineDistance(
+        parsedLogs[i-1].lat, parsedLogs[i-1].lng,
+        parsedLogs[i].lat, parsedLogs[i].lng
+      );
+      // Skip jumps > 100m (noise/gaps) — don't add to distance
+      if (d < 100) totalDistanceM += d;
+    }
+
     const sessionResult = await pool.query(
       `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
@@ -282,7 +280,7 @@ router.post("/:id/stop", async (req, res) => {
       );
     }
 
-    console.log(`[stop] ${sessionName} | ${parsedLogs.length} pts | ${durationSecs}s`);
+    console.log(`[stop] ${sessionName} | ${parsedLogs.length} pts | ${durationSecs}s | ${(totalDistanceM/1000).toFixed(2)}km`);
 
     clearUserState(userId);
 
@@ -290,6 +288,9 @@ router.post("/:id/stop", async (req, res) => {
     const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
     const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) : null;
     const rawTrail = trailDots.map((d) => JSON.parse(d));
+
+    // snapTrajectory on full trail — much more accurate than per-ping snapping
+    // because OSRM sees the whole path and finds the most consistent road sequence
     const parsedTrail = rawTrail.length >= 2 ? await snapTrajectory(rawTrail) : rawTrail;
 
     await Promise.all([
@@ -308,6 +309,7 @@ router.post("/:id/stop", async (req, res) => {
         id: sessionId, name: sessionName, userId,
         startedAt: sessionStart, endedAt: now,
         durationSecs, totalPings: parsedLogs.length,
+        totalDistanceM: Math.round(totalDistanceM),
         startLocation, endLocation,
         startMarker, stopMarker, trail: parsedTrail,
       },
