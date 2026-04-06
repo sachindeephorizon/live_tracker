@@ -13,7 +13,7 @@
 
 const MAX_SPEED_MS = 80;          // ~290 km/h
 const STATIONARY_THRESHOLD = 4;   // meters
-const MAX_JUMP_DIST = 300;        // meters
+const MAX_JUMP_DIST = 1000;        // meters
 const MAX_DT = 60;                // seconds — covers Doze gaps
 const ACCURACY_THRESHOLD = 35;    // meters
 const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
