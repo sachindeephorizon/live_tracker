@@ -73,6 +73,20 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       state.prev.latitude !== processed.latitude ||
       state.prev.longitude !== processed.longitude;
 
+    // Compute speed (m/s) from prev → filtered point so the client can
+    // display it without running its own filter.
+    let computedSpeed = 0;
+    if (state.prev && isRealMovement) {
+      const dtSec = (processed.timestamp - state.prev.timestamp) / 1000;
+      if (dtSec > 0) {
+        const segDist = haversineDistance(
+          state.prev.latitude, state.prev.longitude,
+          processed.latitude, processed.longitude,
+        );
+        computedSpeed = segDist / dtSec;
+      }
+    }
+
     state.prev = processed;
     await saveUserState(userId);
 
@@ -118,6 +132,9 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       userId,
       lat: finalLat,
       lng: finalLng,
+      speed: computedSpeed,
+      accuracy: userAccuracy,
+      moving: isRealMovement,
       timestamp: now,
       startedAt: sessionStartedAt,
     };
