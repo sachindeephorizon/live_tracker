@@ -133,7 +133,11 @@ router.get("/:id/session-distance", async (req, res) => {
     for (let i = 1; i < logs.length; i++) {
       const curr = JSON.parse(logs[i]);
       const d = haversineDistance(prev.lat, prev.lng, curr.lat, curr.lng);
-      if (d < 100) {
+      // FIX: was `d < 100` — that filtered out every vehicle segment.
+      // At 80 km/h with 5s pings you move ~111m, so all segments were dropped.
+      // Use MAX_JUMP_DIST (1000m) to match the same threshold processLocation uses
+      // when accepting pings.
+      if (d < 1000) {
         totalDistance += d;
       }
       prev = curr;

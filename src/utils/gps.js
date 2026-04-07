@@ -11,11 +11,12 @@
  * ═══════════════════════════════════════════════════════════════════
  */
 
-const MAX_SPEED_MS = 80;          // ~290 km/h
-const STATIONARY_THRESHOLD = 4;   // meters
-const MAX_JUMP_DIST = 1000;        // meters
+// MUST MATCH frontend src/config/constants.ts
+const MAX_SPEED_MS = 80;          // GPS.MAX_SPEED
+const STATIONARY_THRESHOLD = 2;   // GPS.MIN_MOVEMENT
+const MAX_JUMP_DIST = 1000;       // GPS.MAX_JUMP
 const MAX_DT = 60;                // seconds — covers Doze gaps
-const ACCURACY_THRESHOLD = 35;    // meters
+const ACCURACY_THRESHOLD = 150;   // GPS.MAX_ACCURACY
 const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
 const GAP_RESET_SECONDS = 60;     // if gap > 60s, treat as fresh start
 
